@@ -296,3 +296,89 @@ def clear_plan(student_id: str):
 def get_profile(student_id: str):
     student = require_student(student_id)
     return {"student_id": student_id, "history": student["history"], "plan": student["plan"]}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: degree audit engine
+# ---------------------------------------------------------------------------
+
+GRADUATION_CREDITS = 120
+SEASON_ORDER = {"W": 0, "SP": 1, "S": 2, "F": 3}
+TERM_RE = re.compile(r"^(\d{2})(SP|W|S|F)$")
+
+
+def term_key(term: str) -> tuple:
+    """'24W' -> (24, 0); '26SP' -> (26, 1). Unknown formats sort last."""
+    m = TERM_RE.match((term or "").strip().upper())
+    if not m:
+        return (999, 9)
+    return (int(m.group(1)), SEASON_ORDER[m.group(2)])
+
+
+def display_code(code: str) -> str:
+    """'COSC3127' -> 'COSC-3127' for readable messages."""
+    m = re.match(r"^([A-Z]+)(\d.*)$", code)
+    return f"{m.group(1)}-{m.group(2)}" if m else code
+
+
+def build_audit(student: dict) -> dict:
+    # Normalized code -> terms in which it was Completed
+    completed: Dict[str, List[str]] = {}
+    earned_by_course: Dict[str, int] = {}
+    for entry in student["history"]:
+        if entry["status"] != "Completed":
+            continue  # non-completed attempts contribute 0
+        code = normalize_code(entry["course_code"])
+        completed.setdefault(code, []).append(entry["term"])
+        # Retakes: count each completed course once
+        earned_by_course[code] = max(earned_by_course.get(code, 0), entry["credits_earned"])
+
+    errors_by_term: Dict[str, List[dict]] = {}
+    cross_list_violations: List[dict] = []
+    total_planned = 0
+
+    for planned in student["plan"]:
+        code = normalize_code(planned["course_code"])
+        term = planned["term"]
+        course = CATALOG.get(code) or {}
+        total_planned += course.get("credits") or 0
+
+        for prereq in course.get("prerequisites", []):
+            if not any(term_key(t) < term_key(term) for t in completed.get(prereq, [])):
+                errors_by_term.setdefault(term, []).append({
+                    "course_code": planned["course_code"],
+                    "type": "MISSING_PREREQUISITE",
+                    "message": f"Missing prerequisite: {display_code(prereq)}",
+                })
+
+        # Cross-listing may be declared on either course in the catalog
+        partners = set(course.get("cross_listed", []))
+        partners |= {c for c, info in CATALOG.items() if code in info.get("cross_listed", [])}
+        for partner in sorted(partners - {code}):
+            if partner in completed:
+                cross_list_violations.append({
+                    "course_code": planned["course_code"],
+                    "type": "CROSS_LIST_CONFLICT",
+                    "message": f"Cross-listed with completed course {display_code(partner)}",
+                })
+
+    total_earned = sum(earned_by_course.values())
+    return {
+        "timeline_validation": [
+            {"term": t, "errors": errors_by_term[t]} for t in sorted(errors_by_term, key=term_key)
+        ],
+        "cross_list_violations": cross_list_violations,
+        "credit_summary": {
+            "total_earned": total_earned,
+            "total_planned": total_planned,
+            "total_remaining_for_graduation": max(0, GRADUATION_CREDITS - total_earned - total_planned),
+        },
+    }
+
+
+@app.get("/api/v1/students/{student_id}/audit-report")
+def audit_report(student_id: str, strict: bool = False):
+    audit = build_audit(require_student(student_id))
+    has_issues = bool(audit["timeline_validation"] or audit["cross_list_violations"])
+    status = ("failed" if strict else "warning") if has_issues else "ok"
+    return {"student_id": student_id, "status": status, **audit}
