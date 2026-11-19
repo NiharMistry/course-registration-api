@@ -27,9 +27,17 @@ def test_full_audit_flow(api):
     r = api.post("/api/v1/admin/catalog/import", files={"file": ("c.html", catalog, "text/html")})
     assert r.status_code == 200
 
+    api.post("/api/v1/auth/register", json={"username": "ci1", "password": "ci-pass"})
+    token = api.post("/api/v1/auth/login", json={"username": "ci1", "password": "ci-pass"}).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
     transcript = (HERE / "student-example.html").read_bytes()
     r = api.post("/api/v1/students/ci1/history/import", files={"file": ("t.html", transcript, "text/html")})
+    assert r.status_code == 401  # BOLA lock: no token
+    r = api.post("/api/v1/students/ci1/history/import", headers=headers,
+                 files={"file": ("t.html", transcript, "text/html")})
     assert r.status_code == 201 and r.json()["past_courses_imported"] == 33
+    assert api.get("/api/v1/students/ci1/recommendations", headers=headers).status_code == 200
 
     # ITEC-3506 is cross-listed with COSC-3506, which this student completed in 26W
     plan = {"planned_courses": [{"course_code": "ITEC-3506", "term": "26F"},

@@ -11,14 +11,135 @@ The parser reads the STRUCTURE of the HTML (table header -> column index),
 never specific course codes or titles.
 """
 
+import os
 import re
-from typing import Dict, List, Optional
+import secrets
+import time
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional
 
+import bcrypt
+import jwt
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Course Registration API", version="1.0.0")
+
+# ---------------------------------------------------------------------------
+# Phase 4: identity (JWT + bcrypt), BOLA / RBAC helpers, rate limiting
+# ---------------------------------------------------------------------------
+
+# Set JWT_SECRET in the environment for stable tokens across restarts.
+JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_hex(32)
+JWT_ALGORITHM = "HS256"
+TOKEN_TTL_SECONDS = 3600
+BCRYPT_ROUNDS = 10  # keeps hashing fast enough on a 0.1-CPU free instance
+
+# username -> {"password_hash": str, "role": "student" | "admin"}; never plain-text passwords
+USERS: Dict[str, dict] = {}
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("utf-8")
+
+
+def seed_admin() -> None:
+    USERS["admin"] = {"password_hash": hash_password("admin"), "role": "admin"}
+
+
+seed_admin()
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def unauthorized(detail: str = "Unauthorized") -> HTTPException:
+    return HTTPException(status_code=401, detail=detail, headers={"WWW-Authenticate": "Bearer"})
+
+
+def decode_token(token: str) -> dict:
+    """Verify signature + expiry; raise 401 on any problem."""
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                            options={"require": ["sub", "exp"]})
+    except jwt.PyJWTError:
+        raise unauthorized("Invalid or expired token")
+    if claims["sub"] not in USERS:
+        raise unauthorized("Unknown user")
+    return claims
+
+
+def current_claims(creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> dict:
+    if creds is None:
+        raise unauthorized("Missing bearer token")
+    return decode_token(creds.credentials)
+
+
+def require_owner(student_id: str, claims: dict) -> None:
+    """BOLA lock: the token's subject must be exactly this student."""
+    if claims["sub"] != student_id:
+        raise unauthorized("Token does not belong to this student")
+
+
+def require_owner_or_admin(student_id: str, claims: dict) -> None:
+    """RBAC: the owner, or any token with role=admin."""
+    if claims["sub"] != student_id and claims.get("role") != "admin":
+        raise unauthorized("Not allowed to access this student")
+
+
+RATE_LIMIT = 10
+RATE_WINDOW_SECONDS = 60.0
+_rate_hits: Dict[str, Deque[float]] = defaultdict(deque)
+
+
+def rate_limit(request: Request,
+               creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> None:
+    """Sliding window: at most RATE_LIMIT requests per key in any RATE_WINDOW_SECONDS."""
+    key = None
+    if creds is not None:
+        try:
+            key = "sub:" + decode_token(creds.credentials)["sub"]
+        except HTTPException:
+            key = None
+    if key is None:
+        key = "ip:" + (request.client.host if request.client else "unknown")
+
+    now = time.monotonic()
+    hits = _rate_hits[key]
+    while hits and now - hits[0] >= RATE_WINDOW_SECONDS:
+        hits.popleft()
+    if len(hits) >= RATE_LIMIT:
+        retry_after = int(RATE_WINDOW_SECONDS - (now - hits[0])) + 1
+        raise HTTPException(status_code=429, detail="Too Many Requests",
+                            headers={"Retry-After": str(retry_after)})
+    hits.append(now)
+
+
+class Credentials(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
+@app.post("/api/v1/auth/register", status_code=201)
+def register(body: Credentials):
+    if body.username in USERS:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    USERS[body.username] = {"password_hash": hash_password(body.password), "role": "student"}
+    return {"status": "registered"}
+
+
+@app.post("/api/v1/auth/login")
+def login(body: Credentials):
+    user = USERS.get(body.username)
+    if user is None or not bcrypt.checkpw(body.password.encode("utf-8"),
+                                          user["password_hash"].encode("utf-8")):
+        raise unauthorized("Invalid username or password")
+    now = int(time.time())
+    claims = {"sub": body.username, "role": user["role"], "iat": now, "exp": now + TOKEN_TTL_SECONDS}
+    return {"access_token": jwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGORITHM),
+            "token_type": "bearer"}
+
 
 # In-memory "database": normalized course code -> course dict
 CATALOG: Dict[str, dict] = {}
@@ -251,7 +372,9 @@ def require_student(student_id: str) -> dict:
 
 
 @app.post("/api/v1/students/{student_id}/history/import", status_code=201)
-async def import_history(student_id: str, file: UploadFile = File(...)):
+async def import_history(student_id: str, file: UploadFile = File(...),
+                         claims: dict = Depends(current_claims)):
+    require_owner(student_id, claims)
     raw = await file.read()
     history = parse_transcript(raw.decode("utf-8", errors="replace"))
     student = STUDENTS.setdefault(student_id, {"history": [], "plan": []})
@@ -292,8 +415,16 @@ def clear_plan(student_id: str):
     return {"status": "success", "message": "Plan cleared"}
 
 
+@app.get("/api/v1/students/{student_id}/plan")
+def get_plan(student_id: str, claims: dict = Depends(current_claims)):
+    require_owner_or_admin(student_id, claims)
+    student = require_student(student_id)
+    return {"student_id": student_id, "plan": student["plan"]}
+
+
 @app.get("/api/v1/students/{student_id}/profile")
-def get_profile(student_id: str):
+def get_profile(student_id: str, claims: dict = Depends(current_claims)):
+    require_owner_or_admin(student_id, claims)
     student = require_student(student_id)
     return {"student_id": student_id, "history": student["history"], "plan": student["plan"]}
 
@@ -376,9 +507,67 @@ def build_audit(student: dict) -> dict:
     }
 
 
-@app.get("/api/v1/students/{student_id}/audit-report")
+@app.get("/api/v1/students/{student_id}/audit-report", dependencies=[Depends(rate_limit)])
 def audit_report(student_id: str, strict: bool = False):
     audit = build_audit(require_student(student_id))
     has_issues = bool(audit["timeline_validation"] or audit["cross_list_violations"])
     status = ("failed" if strict else "warning") if has_issues else "ok"
     return {"student_id": student_id, "status": status, **audit}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: recommendations (Kahn's topological sort, level by level)
+# ---------------------------------------------------------------------------
+
+DEFAULT_START_TERM = "26F"
+
+
+def next_term(term: str) -> str:
+    """Fall -> next year's Winter; any other season -> same year's Fall."""
+    year, season = term_key(term)
+    return f"{year + 1:02d}W" if season == SEASON_ORDER["F"] else f"{year:02d}F"
+
+
+def course_label(code: str) -> str:
+    """'COSC2006' -> 'COSC 2006' (catalog style)."""
+    m = re.match(r"^([A-Z]+)(\d.*)$", code)
+    return f"{m.group(1)} {m.group(2)}" if m else code
+
+
+def build_pathway(student: dict) -> List[dict]:
+    completed = {normalize_code(e["course_code"]) for e in student["history"] if e["status"] == "Completed"}
+    remaining = set(CATALOG) - completed
+
+    # DAG over remaining courses; a prerequisite that is neither completed nor
+    # offered keeps its dependents blocked forever (indegree never reaches 0).
+    indegree: Dict[str, int] = {}
+    dependents: Dict[str, List[str]] = defaultdict(list)
+    for code in remaining:
+        prereqs = set(CATALOG[code].get("prerequisites", [])) - completed - {code}
+        indegree[code] = len(prereqs)
+        for p in prereqs:
+            dependents[p].append(code)
+
+    known_terms = [e["term"] for e in student["history"] if term_key(e["term"])[0] != 999]
+    term = next_term(max(known_terms, key=term_key)) if known_terms else DEFAULT_START_TERM
+
+    pathway: List[dict] = []
+    frontier = sorted(c for c, d in indegree.items() if d == 0)
+    while frontier:
+        pathway.append({"term": term, "courses": [course_label(c) for c in frontier]})
+        unlocked = []
+        for code in frontier:
+            for dep in dependents[code]:
+                indegree[dep] -= 1
+                if indegree[dep] == 0:
+                    unlocked.append(dep)
+        frontier = sorted(unlocked)
+        term = next_term(term)
+    return pathway
+
+
+@app.get("/api/v1/students/{student_id}/recommendations")
+def recommendations(student_id: str, claims: dict = Depends(current_claims)):
+    require_owner_or_admin(student_id, claims)
+    student = require_student(student_id)
+    return {"student_id": student_id, "recommended_pathway": build_pathway(student)}
